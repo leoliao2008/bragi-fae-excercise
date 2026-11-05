@@ -177,7 +177,7 @@ class SmartCaseDevice internal constructor(
         val buttons = (0 until buttonCount).map { buttonIndex ->
             val offset = 2 + buttonIndex * 4
             SmartCaseButton(
-                imageIndex = payload[offset + 1].toUnsignedInt(),
+                imageIndex = payload[offset + 0].toUnsignedInt(),
                 backgroundRed = payload[offset + 1].toUnsignedInt(),
                 backgroundGreen = payload[offset + 2].toUnsignedInt(),
                 backgroundBlue = payload[offset + 3].toUnsignedInt(),
