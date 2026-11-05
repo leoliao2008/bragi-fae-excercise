@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Smart Case</string>
+    <string name="title">Bragi Smart Case</string>
+    <string name="not_advertising">Not advertising. Turn Bluetooth on, allow Nearby devices, and restart the app.</string>
+    <string name="button_description">Button %1$d</string>
+</resources>
