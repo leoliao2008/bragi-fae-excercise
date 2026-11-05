@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">Smart Case Control</string>
     <string name="bluetooth_permission_title">Bluetooth access</string>
-    <string name="bluetooth_permission_rationale">Allow Bluetooth access to find and control nearby smart watches</string>
+    <string name="bluetooth_permission_rationale">Allow Bluetooth access to find and control nearby smart cases</string>
     <string name="continue_button">Continue</string>
     <string name="permission_denied">Bluetooth access is needed to find smart cases. Allow it in the system settings.</string>
     <string name="device_list_title">Smart Cases</string>
