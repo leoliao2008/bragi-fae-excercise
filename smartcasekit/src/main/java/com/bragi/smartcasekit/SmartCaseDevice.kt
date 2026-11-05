@@ -14,6 +14,11 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -21,10 +26,13 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
@@ -38,6 +46,12 @@ private val DISCOVERY_TIMEOUT = 10.seconds
 private val DESCRIPTOR_TIMEOUT = 5.seconds
 private val REQUEST_TIMEOUT = 5.seconds
 private val DISCONNECT_TIMEOUT = 5.seconds
+
+//heartbeat parameters
+private val HEARTBEAT_INTERVAL = 3.seconds
+private val HEARTBEAT_TIMEOUT = 2.seconds
+private const val HEARTBEAT_MAX_FAILURES = 2
+
 
 /**
  * A discovered smart case. Get instances from [SmartCaseScanner.devices].
@@ -75,17 +89,32 @@ class SmartCaseDevice internal constructor(
     /** Button events sent by the smart case while connected. */
     val buttonEvents: SharedFlow<ButtonEvent> = _buttonEvents.asSharedFlow()
 
-    @Volatile private var gatt: BluetoothGatt? = null
-    @Volatile private var characteristic: BluetoothGattCharacteristic? = null
-    @Volatile private var mtu = DEFAULT_MTU
-    @Volatile private var connectionWaiter: CompletableDeferred<Unit>? = null
-    @Volatile private var mtuWaiter: CompletableDeferred<Unit>? = null
-    @Volatile private var servicesWaiter: CompletableDeferred<Unit>? = null
-    @Volatile private var descriptorWaiter: CompletableDeferred<Unit>? = null
-    @Volatile private var disconnectWaiter: CompletableDeferred<Unit>? = null
+    @Volatile
+    private var gatt: BluetoothGatt? = null
+    @Volatile
+    private var characteristic: BluetoothGattCharacteristic? = null
+    @Volatile
+    private var mtu = DEFAULT_MTU
+    @Volatile
+    private var connectionWaiter: CompletableDeferred<Unit>? = null
+    @Volatile
+    private var mtuWaiter: CompletableDeferred<Unit>? = null
+    @Volatile
+    private var servicesWaiter: CompletableDeferred<Unit>? = null
+    @Volatile
+    private var descriptorWaiter: CompletableDeferred<Unit>? = null
+    @Volatile
+    private var disconnectWaiter: CompletableDeferred<Unit>? = null
     private val pendingRequests = ConcurrentHashMap<Int, CompletableDeferred<SbscMessage>>()
     private val requestMutex = Mutex()
     private val connectionMutex = Mutex()
+
+    //heartbeat
+    private val heartbeatJob = SupervisorJob()
+    private val heartbeatScope = CoroutineScope(heartbeatJob + Dispatchers.Default)
+    private var heartbeatTask: Job? = null
+    private val _connectionLost = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val connectionLost: SharedFlow<Unit> = _connectionLost.asSharedFlow()
 
     /**
      * Connect, discover the SBSC service, enable notifications, and fetch the buttons.
@@ -100,7 +129,12 @@ class SmartCaseDevice internal constructor(
             try {
                 awaitCallback("connect", CONNECT_TIMEOUT) { waiter ->
                     connectionWaiter = waiter
-                    gatt = bluetoothDevice.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+                    gatt = bluetoothDevice.connectGatt(
+                        context,
+                        false,
+                        callback,
+                        BluetoothDevice.TRANSPORT_LE
+                    )
                 }
                 val gatt = gatt ?: throw SmartCaseException.NotConnected()
                 try {
@@ -127,13 +161,19 @@ class SmartCaseDevice internal constructor(
                 gatt.setCharacteristicNotification(characteristic, true)
                 awaitCallback("enableNotifications", DESCRIPTOR_TIMEOUT) { waiter ->
                     descriptorWaiter = waiter
-                    if (!writeDescriptor(gatt, cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
+                    if (!writeDescriptor(
+                            gatt,
+                            cccd,
+                            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        )
+                    ) {
                         waiter.completeExceptionally(SmartCaseException.GattFailure("Descriptor write did not start"))
                     }
                 }
                 this.characteristic = characteristic
                 _isConnected.value = true
                 Log.d(TAG, "Connected $address")
+                startHeartbeat()
             } catch (e: Throwable) {
                 Log.w(TAG, "Connect failed", e)
                 closeGatt()
@@ -145,6 +185,52 @@ class SmartCaseDevice internal constructor(
         } catch (e: SmartCaseException) {
             Log.w(TAG, "Fetching buttons failed", e)
         }
+    }
+
+    private fun startHeartbeat() {
+        heartbeatTask?.cancel()
+        heartbeatTask = heartbeatScope.launch {
+            var failures = 0
+            while (isActive) {
+                delay(HEARTBEAT_INTERVAL)
+                if (!_isConnected.value) break
+
+                val ok = try {
+                    val response = withTimeoutOrNull(HEARTBEAT_TIMEOUT) {
+                        sendRequest(
+                            SbscMessage(
+                                SbscMessage.nextId(),
+                                MessageType.REQUEST,
+                                MessageAction.GET_BUTTONS,
+                            ),
+                        )
+                    }
+                    response != null
+                } catch (e: SmartCaseException) {
+                    false
+                } catch (e: CancellationException) {
+                    throw e
+                }
+
+                if (ok) {
+                    failures = 0
+                } else {
+                    failures++
+                    Log.w(TAG, "Heartbeat failed, consecutive=$failures")
+                    if (failures >= HEARTBEAT_MAX_FAILURES) {
+                        Log.w(TAG, "Heartbeat lost, closing connection")
+                        _connectionLost.tryEmit(Unit)
+                        closeGatt()
+                        return@launch
+                    }
+                }
+            }
+        }
+    }
+
+    private fun stopHeartbeat() {
+        heartbeatTask?.cancel()
+        heartbeatTask = null
     }
 
     /** Disconnect. Returns once disconnected, or after a timeout. The connection is closed in both cases. */
@@ -169,9 +255,17 @@ class SmartCaseDevice internal constructor(
      * @throws SmartCaseException if not connected, or if the request fails or times out.
      */
     suspend fun fetchButtons(): List<SmartCaseButton> {
-        val response = sendRequest(SbscMessage(SbscMessage.nextId(), MessageType.REQUEST, MessageAction.GET_BUTTONS))
+        val response = sendRequest(
+            SbscMessage(
+                SbscMessage.nextId(),
+                MessageType.REQUEST,
+                MessageAction.GET_BUTTONS
+            )
+        )
         val payload = response.payload
-        if (payload.size < 2 || response.status != 0) throw SmartCaseException.InvalidResponse(response.toString())
+        if (payload.size < 2 || response.status != 0) throw SmartCaseException.InvalidResponse(
+            response.toString()
+        )
         val buttonCount = payload[1].toUnsignedInt()
         if (payload.size < 2 + buttonCount * 4) throw SmartCaseException.InvalidResponse(response.toString())
         val buttons = (0 until buttonCount).map { buttonIndex ->
@@ -196,7 +290,12 @@ class SmartCaseDevice internal constructor(
     suspend fun setButtonImage(index: Int, imageIndex: Int) {
         val payload = byteArrayOf(index.toByte(), imageIndex.toByte())
         val response = sendRequest(
-            SbscMessage(SbscMessage.nextId(), MessageType.REQUEST, MessageAction.SET_BUTTON_IMAGE, payload),
+            SbscMessage(
+                SbscMessage.nextId(),
+                MessageType.REQUEST,
+                MessageAction.SET_BUTTON_IMAGE,
+                payload
+            ),
         )
         if (response.status != 0) throw SmartCaseException.InvalidResponse(response.toString())
         updateButton(index) { it.copy(imageIndex = imageIndex) }
@@ -210,10 +309,21 @@ class SmartCaseDevice internal constructor(
     suspend fun setButton(index: Int, imageIndex: Int, red: Int, green: Int, blue: Int) {
         val payload = byteArrayOf(index.toByte(), red.toByte(), green.toByte(), blue.toByte())
         val response = sendRequest(
-            SbscMessage(SbscMessage.nextId(), MessageType.REQUEST, MessageAction.SET_BUTTON_BACKGROUND, payload),
+            SbscMessage(
+                SbscMessage.nextId(),
+                MessageType.REQUEST,
+                MessageAction.SET_BUTTON_BACKGROUND,
+                payload
+            ),
         )
         if (response.status != 0) throw SmartCaseException.InvalidResponse(response.toString())
-        updateButton(index) { it.copy(backgroundRed = red, backgroundGreen = green, backgroundBlue = blue) }
+        updateButton(index) {
+            it.copy(
+                backgroundRed = red,
+                backgroundGreen = green,
+                backgroundBlue = blue
+            )
+        }
         setButtonImage(index, imageIndex)
     }
 
@@ -223,6 +333,7 @@ class SmartCaseDevice internal constructor(
             when {
                 newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS ->
                     connectionWaiter?.complete(Unit)
+
                 newState == BluetoothProfile.STATE_DISCONNECTED && status == BluetoothGatt.GATT_SUCCESS -> {
                     closeGatt()
                     disconnectWaiter?.complete(Unit)
@@ -238,7 +349,11 @@ class SmartCaseDevice internal constructor(
             }
         }
 
-        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 descriptorWaiter?.complete(Unit)
             } else {
@@ -262,7 +377,10 @@ class SmartCaseDevice internal constructor(
 
         @Deprecated("Called on API 32 and lower")
         @Suppress("DEPRECATION")
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
+        ) {
             handleIncoming(characteristic.value ?: return)
         }
     }
@@ -277,16 +395,24 @@ class SmartCaseDevice internal constructor(
             MessageType.RESPONSE -> {
                 Log.d(TAG, "Response $message")
                 val pending = pendingRequests.remove(message.id)
-                if (pending == null) Log.e(TAG, "No pending request for $message") else pending.complete(message)
+                if (pending == null) Log.e(
+                    TAG,
+                    "No pending request for $message"
+                ) else pending.complete(message)
             }
+
             MessageType.NOTIFICATION -> {
                 Log.d(TAG, "Notification $message")
                 if (message.action == MessageAction.BUTTON_EVENT && message.payload.size >= 2) {
                     _buttonEvents.tryEmit(
-                        ButtonEvent(message.payload[0].toUnsignedInt(), message.payload[1].toUnsignedInt()),
+                        ButtonEvent(
+                            message.payload[0].toUnsignedInt(),
+                            message.payload[1].toUnsignedInt()
+                        ),
                     )
                 }
             }
+
             MessageType.REQUEST -> Log.e(TAG, "Unexpected request $message")
         }
     }
@@ -305,7 +431,8 @@ class SmartCaseDevice internal constructor(
             if (!writeCharacteristic(gatt, characteristic, bytes)) {
                 throw SmartCaseException.GattFailure("Write did not start for $request")
             }
-            withTimeoutOrNull(REQUEST_TIMEOUT) { response.await() } ?: throw SmartCaseException.Timeout(request.action.name)
+            withTimeoutOrNull(REQUEST_TIMEOUT) { response.await() }
+                ?: throw SmartCaseException.Timeout(request.action.name)
         } finally {
             pendingRequests.remove(request.id)
         }
@@ -322,10 +449,17 @@ class SmartCaseDevice internal constructor(
     }
 
     private fun updateButton(index: Int, transform: (SmartCaseButton) -> SmartCaseButton) {
-        _buttons.update { buttons -> buttons.mapIndexed { i, button -> if (i == index) transform(button) else button } }
+        _buttons.update { buttons ->
+            buttons.mapIndexed { i, button ->
+                if (i == index) transform(
+                    button
+                ) else button
+            }
+        }
     }
 
     private fun closeGatt() {
+        stopHeartbeat()
         gatt?.close()
         gatt = null
         characteristic = null
@@ -354,7 +488,11 @@ class SmartCaseDevice internal constructor(
         }
 
     @Suppress("DEPRECATION")
-    private fun writeDescriptor(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, value: ByteArray): Boolean =
+    private fun writeDescriptor(
+        gatt: BluetoothGatt,
+        descriptor: BluetoothGattDescriptor,
+        value: ByteArray
+    ): Boolean =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             gatt.writeDescriptor(descriptor, value) == BluetoothStatusCodes.SUCCESS
         } else {

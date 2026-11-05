@@ -89,6 +89,8 @@ class SmartCaseViewModel(application: Application) : AndroidViewModel(applicatio
             }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    private var connectionLostJob: Job? = null
+
     /** Restart scanning. */
     fun refresh() {
         scanRequests.update { it + 1 }
@@ -119,11 +121,19 @@ class SmartCaseViewModel(application: Application) : AndroidViewModel(applicatio
                 if (_selectedDevice.value === device) deselect()
             }
         }
+        connectionLostJob?.cancel()
+        connectionLostJob = viewModelScope.launch {
+            device.connectionLost.collect {
+                onConnectionLost()
+            }
+        }
     }
 
     /** Disconnect the selected device and return to the device list. */
     fun deselect() {
         val device = _selectedDevice.value ?: return
+        connectionLostJob?.cancel()
+        connectionLostJob = null
         _selectedDevice.value = null
         eventsJob?.cancel()
         _highlightedButton.value = null
@@ -135,16 +145,35 @@ class SmartCaseViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    private fun onConnectionLost() {
+        connectionLostJob?.cancel()
+        connectionLostJob = null
+        _selectedDevice.value = null
+    }
+
     /** Assign the next icon and background color to button [index]. */
     fun onButtonClick(index: Int) {
         val device = _selectedDevice.value ?: return
         val button = device.buttons.value.getOrNull(index) ?: return
-        val nextImageIndex = ICON_INDICES[(ICON_INDICES.indexOf(button.imageIndex) + 1) % ICON_INDICES.size]
-        val colorPosition = BACKGROUND_COLORS.indexOf(Rgb(button.backgroundRed, button.backgroundGreen, button.backgroundBlue))
+        val nextImageIndex =
+            ICON_INDICES[(ICON_INDICES.indexOf(button.imageIndex) + 1) % ICON_INDICES.size]
+        val colorPosition = BACKGROUND_COLORS.indexOf(
+            Rgb(
+                button.backgroundRed,
+                button.backgroundGreen,
+                button.backgroundBlue
+            )
+        )
         val nextColor = BACKGROUND_COLORS[(colorPosition + 1) % BACKGROUND_COLORS.size]
         viewModelScope.launch {
             try {
-                device.setButton(index, nextImageIndex, nextColor.red, nextColor.green, nextColor.blue)
+                device.setButton(
+                    index,
+                    nextImageIndex,
+                    nextColor.red,
+                    nextColor.green,
+                    nextColor.blue
+                )
             } catch (e: SmartCaseException) {
                 Log.w(TAG, "Setting button $index failed", e)
             }
