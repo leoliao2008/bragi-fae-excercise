@@ -72,7 +72,7 @@ class SmartCase(context: Context) {
                     return response(message, success = false)
                 }
                 val red = payload[1].toUnsignedInt()
-                val green = payload[1].toUnsignedInt()
+                val green = payload[2].toUnsignedInt()
                 val blue = payload[3].toUnsignedInt()
                 updateButton(index) { it.copy(red = red, green = green, blue = blue) }
                 response(message, success = true)
